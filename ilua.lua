@@ -429,19 +429,19 @@ Ilua.defaults = {
     result_var = "_",       -- the variable name that stores the last results
     verbose = false,        -- currently unused
 
-    -- things to expose to the enviroment
-    expose = {
-        ["Ilua"] = true, ["ilua"] = true, ["Pretty"] = true,
-        ["p"] = true, ["ls"] = true, ["dir"] = true,
-        ["slice"] = true
-    },
-
     -- internal, for reference only
     savef = nil,
     line_handler_fn = nil,
     global_handler_fn = nil,
     num_prec = nil,
     num_all = nil,
+}
+
+-- things to expose to the enviroment
+Ilua.expose = {
+    ["Ilua"] = true, ["ilua"] = true, ["Pretty"] = true,
+    ["p"] = true, ["ls"] = true, ["dir"] = true,
+    ["slice"] = true
 }
 
 function Ilua:new(params)
