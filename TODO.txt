@@ -1,0 +1,7 @@
+TODO:
+-----
+- documentation, usage
+- ilua-defs include works but is loaded in global enviroment instead of ilua environment
+- provide an option to use global environment
+- presets for pretty printing
+- separate "main" and create a launcher and lib? possibly move some of launcher into lib
