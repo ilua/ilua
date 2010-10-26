@@ -1,3 +1,4 @@
+#!/usr/bin/env lua
 --
 -- ilua.lua
 --
@@ -460,30 +461,107 @@ function Ilua:init(params)
     for k, v in pairs(params) do
         self[k] = v
     end
-    local oh = function(str)
-        if str and str ~= "" then self:output(str) end
-    end
-    self.p = Pretty:new { output_handler = oh }
-    self.ls = Pretty:new { compact=true, depth=1, output_handler = oh }
-    self.dir = Pretty:new { compact=false, depth=1, key="%-20s",
-        function_info=true, table_info=true, output_handler = oh }
-    -- setup environment
-    self.env = setmetatable({}, { __index = g })
+
     -- init collections
     self.collisions = {}
     self.lib = {}
     self.declared = {}
-    -- finish setup
+
+    -- setup environment, use global if requested 
+    if self.global_env then
+        self.env = g
+    else -- else, if an environment was provided, use that, or create new one
+        self.env = self.env or setmetatable({}, { __index = g })
+    end
     self:setup_strict()
+
     -- expose some things to the environment 
     local expose = self.expose 
     self.env.Ilua = expose["Ilua"] and Ilua or nil
     self.env.ilua = expose["ilua"] and self or nil
     self.env.Pretty = expose["Pretty"] and Pretty or nil
-    self.env.p = expose["p"] and self.p or nil
-    self.env.ls = expose["ls"] and self.ls or nil
-    self.env.dir = expose["dir"] and self.dir or nil
     self.env.slice = expose["slice"] and slice or nil
+
+    -- setup pretty print objects
+    local oh = function(str)
+        if str and str ~= "" then self:output(str) end
+    end
+    self.p = Pretty:new { output_handler = oh }
+    self.env.p = expose["p"] and self.p or nil
+    if not self.disable_ls then
+        self.ls = Pretty:new { compact=true, depth=1, output_handler = oh }
+        self.env.ls = expose["ls"] and self.ls or nil
+    end
+    if not self.disable_dir then
+        self.dir = Pretty:new { compact=false, depth=1, key="%-20s",
+            function_info=true, table_info=true, output_handler = oh }
+        self.env.dir = expose["dir"] and self.dir or nil
+    end
+end
+
+-- this is mostly meant for the ilua launcher/main
+-- a separate Ilua instance may need to do something different so wouldn't call this
+function Ilua:start()
+    -- startup message
+    if not self.disable_startup_message then
+        self:output('ILUA: ' .. _VERSION)
+        local jit = rawget(g, "jit") -- hack to show luajit info if it finds it
+        if jit then
+            local version = rawget(jit, "version")
+            local arch = rawget(jit, "arch")
+            self:output(version .. (arch and " ("..arch..")" or ""))
+        end
+    end
+
+    -- to allow for configuration of the ilua instance, require a module 'ilua_instance' 
+    if not self.disable_instance_config then
+        pcall(function()    
+            require 'ilua_instance'
+        end)
+    end
+
+    -- transcript
+    if self.file then
+        print('saving transcript "'..self.file..'"')
+        self.savef = io.open(self.file,'w')
+        self.savef:write('! ilua ', concat(self.args,' '),'\n')
+    end
+
+    -- inject libs already loaded on command line 
+    if self.inject_libs then
+        for i, v in ipairs(self.inject_libs) do
+            self:inject(unpack(v))
+        end
+    end
+
+    -- load postponed libs
+    if self.load_libs then
+        for i, lib in ipairs(self.load_libs) do
+            require(lib)
+        end
+    end
+
+    -- import postponed libs
+    if self.import_libs then
+        for i, lib in ipairs(self.import_libs) do
+            self:import(lib, true)
+        end
+    end
+
+    -- any inject complaints?
+    self:inject()
+
+    -- load postponed files
+    if self.load_files then
+        for i, file in ipairs(self.load_files) do
+            dofile(file)
+        end
+    end
+
+    -- inject helpers
+    if self.inject_helpers then
+        self:helpers()
+    end
 end
 
 -- injects some shortcut variables and functions
@@ -646,8 +724,10 @@ function Ilua:setup_strict()
         if not self.declared[n] and what() ~= "C" then
             local lookup = self.global_handler_fn and self.global_handler_fn(n)
             if lookup then return lookup end
-            lookup = g[n]
-            if lookup then return lookup end
+            if not self.global_env then
+                lookup = g[n]
+                if lookup then return lookup end
+            end
             if self.strict then
                 error("variable '"..tostring(n).."' is not declared", 2)
             end
@@ -670,16 +750,28 @@ function Ilua:run()
     end
 end
 
+--
+-- "main" from here down
+--
+
 local function quit(code,msg)
     io.stderr:write(msg,'\n')
     os.exit(code)
 end
 
+-- expose the main classes to global env so modules/files included can see them
+g.Ilua = Ilua
+g.Pretty = Pretty
 
---- Initial operations which may not succeed!
--- try to bring in any ilua configuration file; don't complain if this is unsuccessful
-pcall(function()    
-    require 'ilua-defs'
+-- try to bring in any ilua configuration files; don't complain if this is unsuccessful.
+-- note that the only things accessible at this point are the Ilua and Pretty classes,
+-- which should be good enough to set/override defaults
+-- (for configuring the default instance, use the module 'ilua_instance' - see Ilua:start())
+pcall(function()
+    require 'ilua_system' -- system wide defaults
+end)
+pcall(function()
+    require 'ilua_global' -- user defaults 
 end)
 
 -- Unix readline support, if readline.so is available...
@@ -697,11 +789,12 @@ if not rl then
     saveline = function(s) end
 end
 
-local ilua = Ilua:new()
-
+local params = {}
 -- process command-line parameters
 if arg then
+    params['args'] = arg
     local i = 1
+    local postpone = true
 
     local function parm_value(opt,parm,def)
         local val = parm:sub(3)
@@ -725,46 +818,63 @@ if arg then
         if opt == '-' then
             opt = v:sub(2,2)			
             if opt == 'h' then
-                quit(0,"ilua (-l lib) (-L lib) (lua files)")            
+                quit(0,"ilua [[ -h | -g | -H | -l <lib> | -L <lib> | -t | -T | -s | -i | -p | <file> ] ... ]")
+            elseif opt == 'g' then
+                params['global_env'] = true
             elseif opt == 'H' then
-                ilua:helpers()
+                params['inject_helpers'] = true
             elseif opt == 'l' then
-                require (parm_value(opt,v))
+                local lib = parm_value(opt,v)
+                if postpone then
+                    params['load_libs'] = params['load_libs'] or {}
+                    append(params['load_libs'], lib)
+                else
+                    require(lib)
+                end
             elseif opt == 'L' then
                 local lib = parm_value(opt,v)
-                local tbl = require (lib)
-                -- we cannot always trust require to return the table!
-                if type(tbl) ~= 'table' then
-                    tbl = g[lib]
-                end
-                ilua:inject(tbl,true,lib)
-            elseif opt == 't' or opt == 'T' then
-                if opt == 'T' then
-                    ilua.file = 'ilua_'..os.date ('%y_%m_%d_%H_%M')..'.log'
+                if postpone then
+                    params['import_libs'] = params['import_libs'] or {}
+                    append(params['import_libs'], lib)
                 else
-                    ilua.file = parm_value(opt,v,"ilua.log")
+                    local tbl = require(lib)
+                    -- we cannot always trust require to return the table!
+                    if type(tbl) ~= 'table' then
+                        tbl = g[lib]
+                    end
+                    params['inject_libs'] = params['inject_libs'] or {}
+                    append(params['inject_libs'], {tbl, true, lib})
                 end
-                print('saving transcript "'..ilua.file..'"')
-                ilua.savef = io.open(ilua.file,'w')
-                ilua.savef:write('! ilua ',concat(arg,' '),'\n')
+            elseif opt == 't' then
+                params['file'] = parm_value(opt,v,"ilua.log")
+            elseif opt == 'T' then
+                params['file'] = 'ilua_'..os.date ('%y_%m_%d_%H_%M')..'.log'
             elseif opt == 's' then
-                ilua.strict = false
+                params['strict'] = false
             elseif opt == 'v' then
-                ilua.verbose = true
+                params['verbose'] = true
+            elseif opt == 'i' then
+                postpone = false
+            elseif opt == 'p' then
+                postpone = true
             end
-        else -- a plain file to be executed immediately
-            dofile(v)
+        else -- a lua file to be executed immediately or later, depending on current value of postpone
+            if postpone then
+                params['load_files'] = params['load_files'] or {}
+                append(params['load_files'], v)
+            else
+                dofile(v)
+            end
         end
         i = i + 1
     end
 end
 
-ilua:output('ILUA: ' .. _VERSION)
-if jit and jit.version then
-    ilua:output(jit.version .. (jit.arch and " ("..jit.arch..")" or ""))
-end
+-- create an Ilua instance
+local ilua = Ilua:new(params)
 
--- any inject complaints?
-ilua:inject()
+-- expose ilua to global environment so any modules/files loaded can see it
+g.ilua = ilua
 
+ilua:start()
 ilua:run()
